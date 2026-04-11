@@ -1,0 +1,68 @@
+# Oracle1 Keeper Config — Cloud ARM64 Profile
+{
+  "watch_processes": [
+    {"name": "openclaw-gateway", "cmd": "pgrep -f 'openclaw.*gateway'"}
+  ],
+  "thresholds": {
+    "ram_warning": 80,
+    "ram_critical": 90,
+    "disk_warning": 85,
+    "cpu_warning": 95,
+    "cpu_sustain_sec": 30,
+    "swap_warning": 50
+  },
+  "process": {
+    "check_interval_sec": 60,
+    "restart_cooldown_sec": 300,
+    "max_restart_attempts": 3
+  },
+  "flywheel": {
+    "enabled": true,
+    "idle_timeout_min": 15,
+    "stuck_timeout_min": 30,
+    "git_repos": ["/home/ubuntu/.openclaw/workspace"],
+    "commit_check_interval_sec": 300
+  },
+  "healing": {
+    "auto_restart_gateway": true,
+    "auto_clean_tmp": true,
+    "tmp_max_gb": 5
+  },
+  "beacon": {
+    "method": "log"
+  },
+  "gpu": {
+    "enabled": false
+  },
+  "github_quota": {
+    "enabled": true,
+    "warning_remaining": 100,
+    "critical_remaining": 10
+  },
+  "beachcomb": {
+    "enabled": true,
+    "scan_interval_sec": 300,
+    "watch_owner": "SuperInstance"
+  },
+  "bottle_watch": {
+    "enabled": true,
+    "vessels": [
+      {"owner": "Lucineer", "repo": "JetsonClaw1-vessel"},
+      {"owner": "SuperInstance", "repo": "superz-vessel"},
+      {"owner": "SuperInstance", "repo": "babel-vessel"}
+    ]
+  },
+  "cloud": {
+    "platform": "oracle-cloud",
+    "arch": "aarch64",
+    "instance": "oracle1"
+  },
+  "logs": {
+    "dir": "/tmp/keeper-logs",
+    "operational": "operations.log",
+    "resource": "resources.log",
+    "beachcomb": "beachcomb.log",
+    "bottle": "bottles.log",
+    "quota": "quota.log"
+  }
+}
