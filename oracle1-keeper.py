@@ -375,3 +375,63 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         keeper.stop()
         print("\n🔮 Oracle1 Keeper stopped.")
+
+# ============================================================
+# MECHANIC INTEGRATION
+# ============================================================
+
+class MechanicDispatcher:
+    """Dispatch fleet-mechanic tasks when the keeper detects problems."""
+    
+    def __init__(self, token: str):
+        self.token = token
+        self.mechanic_repo = "SuperInstance/fleet-mechanic"
+    
+    def dispatch(self, task_type: str, repo: str, details: str = ""):
+        """Trigger the mechanic via GitHub Actions workflow_dispatch."""
+        import json
+        
+        # Option 1: Create an issue on fleet-mechanic (mechanic scans for these)
+        issue_body = {
+            "title": f"[KEEPER] {task_type}: {repo}",
+            "body": f"**Triggered by:** Brothers Keeper (Oracle1)\n"
+                    f"**Task type:** {task_type}\n"
+                    f"**Target repo:** {repo}\n"
+                    f"**Details:** {details}\n"
+                    f"**Timestamp:** {datetime.utcnow().isoformat()}\n\n"
+                    f"/mechanic {task_type} {repo}",
+            "labels": ["keeper-triggered", task_type],
+        }
+        
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{self.mechanic_repo}/issues",
+            data=json.dumps(issue_body).encode(),
+            headers={
+                "Authorization": f"token {self.token}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+                return {"status": "dispatched", "issue": result.get("number"), "url": result.get("html_url")}
+        except Exception as e:
+            return {"status": "failed", "error": str(e)}
+    
+    def dispatch_fix_tests(self, repo: str, test_output: str = ""):
+        """Ask mechanic to fix failing tests in a repo."""
+        return self.dispatch("fix-tests", repo, test_output[:500])
+    
+    def dispatch_gen_docs(self, repo: str):
+        """Ask mechanic to generate missing docs for a repo."""
+        return self.dispatch("gen-docs", repo)
+    
+    def dispatch_review(self, repo: str):
+        """Ask mechanic to review a repo."""
+        return self.dispatch("review", repo)
+    
+    def dispatch_health_scan(self):
+        """Ask mechanic to scan the whole fleet."""
+        return self.dispatch("health-scan", "SuperInstance/*")
