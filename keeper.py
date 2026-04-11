@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-brothers-keeper/keeper.py — The Lighthouse Keeper
+brothers-keeper/keeper.py v2 — The Lighthouse Keeper
 
-External watchdog for agent runtimes (OpenClaw, ZeroClaw, or any git-agent).
+External watchdog for agent runtimes (OpenClaw, ZeroClaw, any git-agent).
 Runs as a separate process on the same hardware.
-Independent of the agent's instance — survives agent crashes.
+Survives agent crashes, OOMs, deadlocks.
 
-Core responsibilities:
-1. RESOURCE MONITORING — RAM, CPU, disk, network. Alert before OOM.
-2. PROCESS WATCHDOG — Track agent processes. Restart if stuck/crashed.
-3. RISK ASSESSMENT — Pre-flight checks before dangerous operations.
-4. OPERATIONAL LOGGING — External observation of inputs/outputs/data changes.
-5. SELF-HEALING — Run openclaw doctor --fix, restart gateway, clean state.
-6. BEACON — Light up when the fleet needs to know.
+v1: Resource monitoring, process watchdog, self-healing, operational logging
+v2: Flywheel monitoring, GPU scheduling, token stewardship, multi-agent coordination
 
-Design principle: The keeper is NOT the ship. The keeper is the lighthouse.
-It observes, warns, and assists — but does not navigate.
+Design: The keeper is NOT the ship. The keeper is the lighthouse.
 """
 
 import os
@@ -25,10 +19,11 @@ import time
 import signal
 import subprocess
 import threading
+import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 
 # ============================================================
@@ -42,66 +37,100 @@ DEFAULT_CONFIG = {
         {"name": "node-agent", "cmd": "pgrep -f 'openclaw.*agent'"},
     ],
 
-    # Resource thresholds (percentage or absolute)
+    # Resource thresholds
     "thresholds": {
-        "ram_warning": 80,      # Alert at 80% RAM
-        "ram_critical": 90,     # Kill processes at 90%
-        "disk_warning": 85,     # Alert at 85% disk
-        "cpu_warning": 95,      # Alert at 95% CPU sustained
-        "cpu_sustain_sec": 30,  # How long CPU must be high to trigger
-        "swap_warning": 50,     # Alert at 50% swap usage
+        "ram_warning": 80, "ram_critical": 90,
+        "disk_warning": 85, "cpu_warning": 95,
+        "cpu_sustain_sec": 30, "swap_warning": 50,
     },
 
     # Process management
     "process": {
-        "check_interval_sec": 30,       # How often to check
-        "restart_cooldown_sec": 300,    # Don't restart more than once per 5min
-        "max_restart_attempts": 3,      # Give up after 3 tries
-        "kill_after_stuck_sec": 300,    # Kill process stuck for 5 min
+        "check_interval_sec": 60,
+        "restart_cooldown_sec": 300,
+        "max_restart_attempts": 3,
     },
 
     # Risk assessment
     "risk": {
-        "max_concurrent_execs": 5,      # Max simultaneous subprocess spawns
-        "max_single_process_mb": 512,   # Kill process exceeding this RSS
-        "dangerous_patterns": [
-            "fork bomb", "while true",
-        ],
-        "pre_flight_check": True,       # Check resources before heavy ops
+        "max_concurrent_execs": 5,
+        "max_single_process_mb": 2048,
+        "pre_flight_check": True,
     },
 
     # Logging
     "logs": {
         "dir": "/var/log/brothers-keeper",
-        "operational": "operations.log",    # What happened outside
-        "resource": "resources.log",         # Resource snapshots
-        "alert": "alerts.log",               # Warnings and emergencies
-        "process": "processes.log",          # Process lifecycle events
-        "max_log_mb": 100,                   # Rotate logs at 100MB
-        "retention_days": 30,                # Keep logs for 30 days
+        "operational": "operations.log",
+        "resource": "resources.log",
+        "alert": "alerts.log",
+        "process": "processes.log",
+        "flywheel": "flywheel.log",
+        "token": "token_usage.log",
+        "schedule": "schedule.log",
     },
 
-    # Self-healing actions
+    # Self-healing
     "healing": {
         "auto_restart_gateway": True,
         "auto_doctor_fix": True,
         "auto_clean_tmp": True,
         "tmp_max_gb": 5,
-        "notify_on_heal": True,
     },
 
-    # Beacon (alerting)
+    # Alerting
     "beacon": {
-        "method": "log",           # "log", "telegram", "webhook"
-        "webhook_url": "",         # For external alerting
-        "telegram_chat_id": "",    # For Telegram alerts
-        "coalesce_sec": 300,       # Don't alert more than once per 5min
+        "method": "log",
+        "telegram_chat_id": "",
+        "webhook_url": "",
+        "coalesce_sec": 300,
+    },
+
+    # v2: FLYWHEEL MONITORING
+    "flywheel": {
+        "enabled": True,
+        "idle_timeout_min": 15,        # Alert if no commits in 15 min during active session
+        "stuck_timeout_min": 30,       # Alert if same checkpoint for 30 min
+        "checkpoint_file": "",         # Path to file agent writes progress to
+        "nudge_cooldown_min": 10,      # Don't nudge more than once per 10 min
+        "git_repos": [],               # Repos to watch for commit activity
+        "commit_check_interval_sec": 300,
+    },
+
+    # v2: GPU SCHEDULING
+    "gpu": {
+        "enabled": True,
+        "slots": [                   # Named GPU time slots
+            {"name": "default", "priority": 0, "max_pct": 100},
+        ],
+        "current_holder": "",        # Which agent currently has GPU priority
+        "holder_expires": "",        # ISO timestamp when slot expires
+        "monitor_cmd": "nvidia-smi",
+        "max_gpu_mem_pct": 90,
+    },
+
+    # v2: TOKEN STEWARDSHIP
+    "token_steward": {
+        "enabled": True,
+        "vault_path": "",            # Path to vault JSON (secrets keeper holds)
+        "allowances": {},            # agent_name -> {provider, daily_limit, used_today, reset_at}
+        "zero_trust": False,         # Strict mode: agents never see raw keys
+        "checkpoint_gated": False,   # Release tokens only at approved checkpoints
+    },
+
+    # v2: MULTI-AGENT COORDINATION
+    "coordination": {
+        "enabled": True,
+        "agents": {},                # Registered agents: {name -> {pid, rss_limit, gpu_quota, priority}}
+        "max_agents": 4,             # Max concurrent agents on this hardware
+        "resource_sharing": True,    # Allow agents to negotiate shared resources
+        "schedule_path": "",         # Path to shared schedule file
     },
 }
 
 
 # ============================================================
-# DATA CLASSES
+# DATA CLASSES (v1 + v2)
 # ============================================================
 
 @dataclass
@@ -117,78 +146,82 @@ class ResourceSnapshot:
     disk_total_gb: float
     disk_used_gb: float
     disk_percent: float
-    load_1m: float
-    load_5m: float
-    load_15m: float
+    load_1m: float = 0
+    load_5m: float = 0
+    load_15m: float = 0
     openclaw_rss_mb: int = 0
+    gpu_mem_used_mb: int = 0
+    gpu_mem_total_mb: int = 0
+    gpu_util_pct: float = 0
     top_processes: List[Dict] = field(default_factory=list)
 
 
 @dataclass
-class ProcessEvent:
+class FlywheelState:
     timestamp: str
-    event_type: str  # "started", "stopped", "restarted", "killed", "stuck"
-    process_name: str
-    pid: Optional[int] = None
-    details: str = ""
+    agent_name: str
+    status: str              # "spinning", "idle", "stuck", "blocked", "completed"
+    current_task: str = ""
+    last_commit_time: Optional[str] = None
+    last_commit_repo: str = ""
+    commits_this_hour: int = 0
+    checkpoint_reached: Optional[str] = None
+    estimated_completion: Optional[str] = None
+    reason: str = ""
 
 
 @dataclass
-class OperationalChange:
+class TokenAllowance:
     timestamp: str
-    category: str  # "input", "output", "data", "config", "network", "commit"
-    description: str
-    before: Optional[str] = None
-    after: Optional[str] = None
-    severity: str = "info"  # "info", "warning", "critical"
+    agent_name: str
+    provider: str
+    daily_limit_usd: float
+    used_today_usd: float = 0
+    tokens_used: int = 0
+    calls_made: int = 0
+    checkpoint: Optional[str] = None
+    checkpoint_approved: bool = False
+    status: str = "active"    # "active", "paused", "exhausted", "revoked"
 
 
 @dataclass
-class Alert:
+class ScheduleEntry:
     timestamp: str
-    level: str  # "warning", "critical", "resolved"
-    category: str  # "resource", "process", "risk", "healing"
-    message: str
-    action_taken: str = ""
-    resolved_at: Optional[str] = None
+    agent_name: str
+    resource: str            # "gpu", "ram", "disk_io"
+    amount: str              # "80%", "4GB", "exclusive"
+    duration_min: int
+    priority: int            # 0=low, 5=normal, 10=critical
+    reason: str = ""
+    status: str = "requested"  # "requested", "approved", "active", "completed", "denied"
 
 
 # ============================================================
-# RESOURCE MONITOR
+# RESOURCE MONITOR (v1 + GPU)
 # ============================================================
 
 class ResourceMonitor:
-    """Read system vitals from /proc (Linux)."""
-
-    def snapshot(self) -> ResourceSnapshot:
+    def snapshot(self, config: Dict = None) -> ResourceSnapshot:
         ram = self._read_meminfo()
         swap = self._read_swap()
         cpu = self._read_cpu()
         disk = self._read_disk()
         load = self._read_load()
-        oc_rss = self._read_openclaw_rss()
+        oc_rss = self._read_process_rss("openclaw")
         top = self._read_top_processes(5)
+        gpu = self._read_gpu(config)
 
         ram_pct = (ram['used'] / ram['total'] * 100) if ram['total'] > 0 else 0
         swap_pct = (swap['used'] / swap['total'] * 100) if swap['total'] > 0 else 0
 
         return ResourceSnapshot(
             timestamp=datetime.utcnow().isoformat(),
-            ram_total_mb=ram['total'],
-            ram_used_mb=ram['used'],
-            ram_percent=ram_pct,
-            swap_total_mb=swap['total'],
-            swap_used_mb=swap['used'],
-            swap_percent=swap_pct,
-            cpu_percent=cpu,
-            disk_total_gb=disk['total'],
-            disk_used_gb=disk['used'],
-            disk_percent=disk['percent'],
-            load_1m=load[0],
-            load_5m=load[1],
-            load_15m=load[2],
-            openclaw_rss_mb=oc_rss,
-            top_processes=top,
+            ram_total_mb=ram['total'], ram_used_mb=ram['used'], ram_percent=ram_pct,
+            swap_total_mb=swap['total'], swap_used_mb=swap['used'], swap_percent=swap_pct,
+            cpu_percent=cpu, disk_total_gb=disk['total'], disk_used_gb=disk['used'],
+            disk_percent=disk['percent'], load_1m=load[0], load_5m=load[1], load_15m=load[2],
+            openclaw_rss_mb=oc_rss, gpu_mem_used_mb=gpu['mem_used'], gpu_mem_total_mb=gpu['mem_total'],
+            gpu_util_pct=gpu['util_pct'], top_processes=top,
         )
 
     def _read_meminfo(self):
@@ -199,8 +232,7 @@ class ResourceMonitor:
                     if line.startswith('MemTotal:'):
                         info['total'] = int(line.split()[1]) // 1024
                     elif line.startswith('MemAvailable:'):
-                        available = int(line.split()[1]) // 1024
-                        info['used'] = info['total'] - available
+                        info['used'] = info['total'] - int(line.split()[1]) // 1024
         except: pass
         return info
 
@@ -212,391 +244,599 @@ class ResourceMonitor:
                     if line.startswith('SwapTotal:'):
                         info['total'] = int(line.split()[1]) // 1024
                     elif line.startswith('SwapFree:'):
-                        free = int(line.split()[1]) // 1024
-                        info['used'] = info['total'] - free
+                        info['used'] = info['total'] - int(line.split()[1]) // 1024
         except: pass
         return info
 
     def _read_cpu(self):
         try:
             with open('/proc/stat') as f:
-                line = f.readline()
-            vals = [int(x) for x in line.split()[1:]]
-            idle = vals[3]
-            total = sum(vals)
+                vals = [int(x) for x in f.readline().split()[1:]]
+            idle, total = vals[3], sum(vals)
             time.sleep(0.1)
             with open('/proc/stat') as f:
-                line = f.readline()
-            vals2 = [int(x) for x in line.split()[1:]]
-            idle2 = vals2[3]
-            total2 = sum(vals2)
-            d_idle = idle2 - idle
-            d_total = total2 - total
+                vals2 = [int(x) for x in f.readline().split()[1:]]
+            d_idle, d_total = vals2[3] - idle, sum(vals2) - total
             return (1.0 - d_idle / d_total) * 100 if d_total > 0 else 0
-        except:
-            return 0
+        except: return 0
 
     def _read_disk(self):
         try:
             r = subprocess.run(['df', '/'], capture_output=True, text=True, timeout=5)
-            line = r.stdout.strip().split('\n')[1]
-            parts = line.split()
-            total = int(parts[1]) // (1024*1024)
-            used = int(parts[2]) // (1024*1024)
-            pct = float(parts[4].rstrip('%'))
-            return {'total': total, 'used': used, 'percent': pct}
-        except:
-            return {'total': 0, 'used': 0, 'percent': 0}
+            parts = r.stdout.strip().split('\n')[1].split()
+            return {'total': int(parts[1])//(1024*1024), 'used': int(parts[2])//(1024*1024), 'percent': float(parts[4].rstrip('%'))}
+        except: return {'total': 0, 'used': 0, 'percent': 0}
 
     def _read_load(self):
         try:
             with open('/proc/loadavg') as f:
-                parts = f.read().split()
-            return (float(parts[0]), float(parts[1]), float(parts[2]))
-        except:
-            return (0, 0, 0)
+                p = f.read().split()
+            return (float(p[0]), float(p[1]), float(p[2]))
+        except: return (0, 0, 0)
 
-    def _read_openclaw_rss(self):
+    def _read_process_rss(self, name):
         try:
-            r = subprocess.run(['pgrep', '-f', 'openclaw'], capture_output=True, text=True, timeout=5)
-            if r.returncode != 0 or not r.stdout.strip():
-                return 0
-            total_rss = 0
+            r = subprocess.run(['pgrep', '-f', name], capture_output=True, text=True, timeout=5)
+            total = 0
             for pid in r.stdout.strip().split('\n'):
-                try:
-                    with open(f'/proc/{pid}/status') as f:
-                        for line in f:
-                            if line.startswith('VmRSS:'):
-                                total_rss += int(line.split()[1])
-                except: pass
-            return total_rss // 1024  # KB to MB
-        except:
-            return 0
+                if pid:
+                    try:
+                        with open(f'/proc/{pid}/status') as f:
+                            for line in f:
+                                if line.startswith('VmRSS:'):
+                                    total += int(line.split()[1])
+                    except: pass
+            return total // 1024
+        except: return 0
 
     def _read_top_processes(self, n=5):
         try:
-            r = subprocess.run(
-                ['ps', 'aux', '--sort=-%mem'],
-                capture_output=True, text=True, timeout=5
-            )
-            lines = r.stdout.strip().split('\n')[1:n+1]
+            r = subprocess.run(['ps', 'aux', '--sort=-%mem'], capture_output=True, text=True, timeout=5)
             procs = []
-            for line in lines:
+            for line in r.stdout.strip().split('\n')[1:n+1]:
                 parts = line.split(None, 10)
                 if len(parts) >= 11:
-                    procs.append({
-                        'user': parts[0], 'pid': int(parts[1]),
-                        'cpu': float(parts[2]), 'mem': float(parts[3]),
-                        'rss_mb': int(parts[5]) // 1024,
-                        'command': parts[10][:80]
-                    })
+                    procs.append({'user': parts[0], 'pid': int(parts[1]), 'cpu': float(parts[2]),
+                        'mem': float(parts[3]), 'rss_mb': int(parts[5])//1024, 'command': parts[10][:80]})
             return procs
-        except:
-            return []
+        except: return []
+
+    def _read_gpu(self, config):
+        gpu = {'mem_used': 0, 'mem_total': 0, 'util_pct': 0}
+        if not config or not config.get('gpu', {}).get('enabled'):
+            return gpu
+        try:
+            cmd = config.get('gpu', {}).get('monitor_cmd', 'nvidia-smi')
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            for line in r.stdout.split('\n'):
+                if 'MiB' in line and '/' in line:
+                    parts = [x.strip() for x in line.split('|') if 'MiB' in x]
+                    if parts:
+                        nums = parts[0].replace('MiB', '').split('/')
+                        gpu['mem_used'] = int(nums[0].strip())
+                        gpu['mem_total'] = int(nums[1].strip()) if len(nums) > 1 else 0
+                for part in line.split():
+                    if part.endswith('%') and 'gpu' not in part.lower():
+                        try:
+                            val = int(part.rstrip('%'))
+                            if 0 <= val <= 100:
+                                gpu['util_pct'] = max(gpu['util_pct'], val)
+                        except: pass
+        except: pass
+        return gpu
 
 
 # ============================================================
-# PROCESS WATCHDOG
+# PROCESS WATCHDOG (v1, unchanged)
 # ============================================================
 
 class ProcessWatchdog:
-    """Track agent processes, detect hangs, restart when needed."""
-
     def __init__(self, config):
         self.config = config
         self.restart_times: Dict[str, datetime] = {}
         self.restart_counts: Dict[str, int] = {}
-        self.last_seen: Dict[str, int] = {}  # name -> PID
+        self.last_seen: Dict[str, int] = {}
 
-    def check(self) -> List[ProcessEvent]:
+    def check(self) -> List:
         events = []
-        for proc in self.config['watch_processes']:
+        for proc in self.config.get('watch_processes', []):
             name = proc['name']
             try:
                 r = subprocess.run(proc['cmd'], shell=True, capture_output=True, text=True, timeout=5)
-                current_pid = int(r.stdout.strip()) if r.stdout.strip() else None
-            except:
-                current_pid = None
+                pid = int(r.stdout.strip()) if r.stdout.strip() else None
+            except: pid = None
 
-            if current_pid:
+            if pid:
                 if name not in self.last_seen:
-                    events.append(ProcessEvent(
-                        timestamp=datetime.utcnow().isoformat(),
-                        event_type="started", process_name=name, pid=current_pid
-                    ))
-                    self.last_seen[name] = current_pid
-                elif self.last_seen[name] != current_pid:
-                    events.append(ProcessEvent(
-                        timestamp=datetime.utcnow().isoformat(),
-                        event_type="restarted", process_name=name,
-                        pid=current_pid,
-                        details=f"PID changed from {self.last_seen[name]}"
-                    ))
-                    self.last_seen[name] = current_pid
-            else:
-                if name in self.last_seen:
-                    events.append(ProcessEvent(
-                        timestamp=datetime.utcnow().isoformat(),
-                        event_type="stopped", process_name=name,
-                        pid=self.last_seen.get(name),
-                        details="Process no longer running"
-                    ))
-                    del self.last_seen[name]
-
+                    events.append({'timestamp': datetime.utcnow().isoformat(), 'event_type': 'started', 'process_name': name, 'pid': pid})
+                    self.last_seen[name] = pid
+                elif self.last_seen[name] != pid:
+                    events.append({'timestamp': datetime.utcnow().isoformat(), 'event_type': 'restarted', 'process_name': name, 'pid': pid})
+                    self.last_seen[name] = pid
+            elif name in self.last_seen:
+                events.append({'timestamp': datetime.utcnow().isoformat(), 'event_type': 'stopped', 'process_name': name, 'pid': self.last_seen.get(name)})
+                del self.last_seen[name]
         return events
 
-    def should_restart(self, name: str) -> bool:
+    def should_restart(self, name):
         now = datetime.utcnow()
-        cooldown = timedelta(seconds=self.config['process']['restart_cooldown_sec'])
-        if name in self.restart_times and (now - self.restart_times[name]) < cooldown:
+        cd = timedelta(seconds=self.config['process']['restart_cooldown_sec'])
+        if name in self.restart_times and (now - self.restart_times[name]) < cd:
             return False
-        if self.restart_counts.get(name, 0) >= self.config['process']['max_restart_attempts']:
-            return False
-        return True
+        return self.restart_counts.get(name, 0) < self.config['process']['max_restart_attempts']
 
-    def restart(self, name: str, method: str = "gateway") -> bool:
-        if not self.should_restart(name):
-            return False
-
+    def restart(self, name, method='gateway'):
+        if not self.should_restart(name): return False
         self.restart_times[name] = datetime.utcnow()
         self.restart_counts[name] = self.restart_counts.get(name, 0) + 1
-
         try:
-            if method == "gateway":
-                subprocess.run(['openclaw', 'gateway', 'restart'],
-                             capture_output=True, timeout=30)
-            elif method == "doctor":
-                subprocess.run(['openclaw', 'doctor', '--fix'],
-                             capture_output=True, timeout=60)
+            if method == 'gateway':
+                subprocess.run(['openclaw', 'gateway', 'restart'], capture_output=True, timeout=30)
+            elif method == 'doctor':
+                subprocess.run(['openclaw', 'doctor', '--fix'], capture_output=True, timeout=60)
             return True
-        except Exception as e:
-            return False
+        except: return False
 
 
 # ============================================================
-# RISK ASSESSOR
+# v2: FLYWHEEL MONITOR
 # ============================================================
 
-class RiskAssessor:
-    """Pre-flight checks and dangerous operation detection."""
+class FlywheelMonitor:
+    """Watches agent productivity. Detects stuck/idle flywheels."""
 
     def __init__(self, config):
         self.config = config
-        self.active_execs: Dict[int, Dict] = {}
+        self.last_nudge: Dict[str, datetime] = {}
+        self.state: Dict[str, FlywheelState] = {}
+        self.checkpoint_history: Dict[str, str] = {}
 
-    def pre_flight(self, snapshot: ResourceSnapshot) -> tuple:
-        """Returns (approved: bool, warnings: list)."""
-        warnings = []
-        approved = True
+    def check(self, agent_name: str = "main") -> FlywheelState:
+        fw_config = self.config.get('flywheel', {})
+        now = datetime.utcnow()
 
-        thresholds = self.config['thresholds']
-        if snapshot.ram_percent > thresholds['ram_critical']:
-            warnings.append(f"RAM critical: {snapshot.ram_percent:.1f}%")
-            approved = False
-        elif snapshot.ram_percent > thresholds['ram_warning']:
-            warnings.append(f"RAM warning: {snapshot.ram_percent:.1f}%")
+        # Check git commit activity
+        commits = self._check_recent_commits(fw_config.get('git_repos', []))
+        last_commit = commits[0] if commits else None
+        commits_this_hour = len([c for c in commits if self._within_minutes(c['time'], 60)])
 
-        if snapshot.swap_percent > thresholds['swap_warning']:
-            warnings.append(f"Swap warning: {snapshot.swap_percent:.1f}%")
+        # Check checkpoint file
+        checkpoint = self._read_checkpoint(fw_config.get('checkpoint_file', ''))
 
-        if snapshot.openclaw_rss_mb > self.config['risk']['max_single_process_mb']:
-            warnings.append(f"OpenClaw RSS high: {snapshot.openclaw_rss_mb}MB")
-            approved = False
+        # Determine status
+        status = "spinning"
+        reason = ""
 
-        if len(self.active_execs) >= self.config['risk']['max_concurrent_execs']:
-            warnings.append(f"Too many concurrent execs: {len(self.active_execs)}")
-            approved = False
+        if last_commit:
+            minutes_since_commit = (now - self._parse_time(last_commit['time'])).total_seconds() / 60
+            if minutes_since_commit > fw_config.get('stuck_timeout_min', 30):
+                status = "stuck"
+                reason = f"No commits in {minutes_since_commit:.0f} min"
+            elif minutes_since_commit > fw_config.get('idle_timeout_min', 15):
+                status = "idle"
+                reason = f"No commits in {minutes_since_commit:.0f} min (idle threshold)"
+            elif commits_this_hour >= 3:
+                status = "spinning"
+                reason = f"{commits_this_hour} commits/hour"
+        else:
+            status = "idle"
+            reason = "No recent commits found"
 
-        return approved, warnings
+        # Check if checkpoint changed
+        prev_cp = self.checkpoint_history.get(agent_name)
+        if checkpoint and checkpoint == prev_cp and status == "stuck":
+            reason += f" | Same checkpoint for >{fw_config.get('stuck_timeout_min', 30)} min"
+        if checkpoint:
+            self.checkpoint_history[agent_name] = checkpoint
 
-    def check_process_risk(self, pid: int, snapshot: ResourceSnapshot) -> str:
-        """Check if a specific process is dangerous. Returns risk level."""
-        for proc in snapshot.top_processes:
-            if proc['pid'] == pid:
-                if proc['rss_mb'] > self.config['risk']['max_single_process_mb']:
-                    return "critical"
-                if proc['cpu'] > 95:
-                    return "warning"
-        return "ok"
+        state = FlywheelState(
+            timestamp=now.isoformat(), agent_name=agent_name,
+            status=status, checkpoint_reached=checkpoint,
+            commits_this_hour=commits_this_hour,
+            last_commit_time=last_commit['time'] if last_commit else None,
+            last_commit_repo=last_commit['repo'] if last_commit else "",
+            reason=reason,
+        )
+        self.state[agent_name] = state
+        return state
 
-    def register_exec(self, exec_id: int, info: Dict):
-        self.active_execs[exec_id] = {**info, 'started': datetime.utcnow().isoformat()}
+    def should_nudge(self, agent_name: str) -> bool:
+        now = datetime.utcnow()
+        cd = timedelta(minutes=self.config.get('flywheel', {}).get('nudge_cooldown_min', 10))
+        if agent_name in self.last_nudge and (now - self.last_nudge[agent_name]) < cd:
+            return False
+        return True
 
-    def unregister_exec(self, exec_id: int):
-        self.active_execs.pop(exec_id, None)
+    def nudge(self, agent_name: str):
+        self.last_nudge[agent_name] = datetime.utcnow()
+
+    def _check_recent_commits(self, repos: List[str], since_min=60) -> List[Dict]:
+        commits = []
+        since = (datetime.utcnow() - timedelta(minutes=since_min)).strftime('%Y-%m-%dT%H:%M:%S')
+        for repo_path in repos:
+            if not os.path.isdir(repo_path):
+                continue
+            try:
+                r = subprocess.run(
+                    ['git', 'log', f'--since={since}', '--oneline', '-10'],
+                    capture_output=True, text=True, cwd=repo_path, timeout=10
+                )
+                for line in r.stdout.strip().split('\n'):
+                    if line:
+                        parts = line.split(None, 1)
+                        commits.append({'hash': parts[0][:8], 'msg': parts[1][:60] if len(parts) > 1 else '', 'repo': os.path.basename(repo_path), 'time': since})
+            except: pass
+        return commits
+
+    def _read_checkpoint(self, path: str) -> Optional[str]:
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                return f.read().strip()[:200]
+        except: return None
+
+    def _within_minutes(self, iso_time: str, minutes: int) -> bool:
+        try:
+            return (datetime.utcnow() - self._parse_time(iso_time)).total_seconds() < minutes * 60
+        except: return True
+
+    def _parse_time(self, t: str) -> datetime:
+        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S']:
+            try: return datetime.strptime(t.split('.')[0], fmt)
+            except: pass
+        return datetime.utcnow()
 
 
 # ============================================================
-# OPERATIONAL LOGGER
+# v2: TOKEN STEWARD
+# ============================================================
+
+class TokenSteward:
+    """Keeper holds secrets. Agents get allowances, not keys.
+
+    The keeper is the trusted holder of API keys.
+    Agents request token use through the keeper.
+    The keeper tracks usage and enforces limits.
+
+    For zero-trust: agents never see raw keys.
+    For internal use: same system, just trusted agents.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.vault_path = config.get('token_steward', {}).get('vault_path', '')
+        self.allowances: Dict[str, TokenAllowance] = {}
+        self._load_allowances()
+
+    def _load_allowances(self):
+        ts = self.config.get('token_steward', {})
+        for agent, info in ts.get('allowances', {}).items():
+            self.allowances[agent] = TokenAllowance(
+                timestamp=datetime.utcnow().isoformat(),
+                agent_name=agent, provider=info.get('provider', ''),
+                daily_limit_usd=info.get('daily_limit_usd', 5.0),
+                used_today_usd=info.get('used_today_usd', 0),
+                tokens_used=info.get('tokens_used', 0),
+                calls_made=info.get('calls_made', 0),
+            )
+
+    def request_tokens(self, agent_name: str, provider: str, estimated_cost_usd: float = 0) -> Tuple[bool, str]:
+        """Agent requests permission to use tokens.
+        Returns (approved, key_or_rejection_reason)."""
+        ts = self.config.get('token_steward', {})
+
+        if not ts.get('enabled'):
+            return True, self._get_raw_key(provider)
+
+        # Check if agent is registered
+        if agent_name not in self.allowances:
+            # Auto-register with default limits
+            self.allowances[agent_name] = TokenAllowance(
+                timestamp=datetime.utcnow().isoformat(),
+                agent_name=agent_name, provider=provider,
+                daily_limit_usd=ts.get('default_daily_limit', 5.0),
+            )
+
+        allowance = self.allowances[agent_name]
+
+        # Check if daily limit exceeded
+        if allowance.used_today_usd + estimated_cost_usd > allowance.daily_limit_usd:
+            return False, f"Daily limit reached: ${allowance.used_today_usd:.2f}/${allowance.daily_limit_usd:.2f}"
+
+        # Check if checkpoint-gated and checkpoint not approved
+        if ts.get('checkpoint_gated') and not allowance.checkpoint_approved:
+            return False, "Checkpoint not yet approved by keeper or captain"
+
+        # Check if zero-trust and agent not verified
+        if ts.get('zero_trust') and not self._verify_agent(agent_name):
+            return False, "Agent not verified for zero-trust token access"
+
+        # Approved
+        if ts.get('zero_trust'):
+            key = self._get_masked_key(provider)
+        else:
+            key = self._get_raw_key(provider)
+
+        allowance.calls_made += 1
+        allowance.used_today_usd += estimated_cost_usd
+        return True, key
+
+    def report_usage(self, agent_name: str, tokens_used: int, actual_cost_usd: float = 0):
+        if agent_name in self.allowances:
+            a = self.allowances[agent_name]
+            a.tokens_used += tokens_used
+            if actual_cost_usd > 0:
+                a.used_today_usd = max(a.used_today_usd, actual_cost_usd)
+
+    def approve_checkpoint(self, agent_name: str, checkpoint: str):
+        if agent_name in self.allowances:
+            a = self.allowances[agent_name]
+            a.checkpoint = checkpoint
+            a.checkpoint_approved = True
+
+    def get_usage_report(self) -> Dict[str, Dict]:
+        return {
+            name: {'provider': a.provider, 'used': a.used_today_usd,
+                    'limit': a.daily_limit_usd, 'calls': a.calls_made,
+                    'tokens': a.tokens_used, 'status': a.status}
+            for name, a in self.allowances.items()
+        }
+
+    def _get_raw_key(self, provider: str) -> str:
+        if not self.vault_path or not os.path.exists(self.vault_path):
+            return ""
+        try:
+            vault = json.load(open(self.vault_path))
+            return vault.get(provider, {}).get('key', '')
+        except: return ""
+
+    def _get_masked_key(self, provider: str) -> str:
+        key = self._get_raw_key(provider)
+        if len(key) > 8:
+            return key[:4] + "..." + key[-4:]
+        return "***"
+
+    def _verify_agent(self, name: str) -> bool:
+        # In zero-trust mode, verify agent identity via public key or known fingerprint
+        coord = self.config.get('coordination', {})
+        return name in coord.get('agents', {})
+
+
+# ============================================================
+# v2: GPU SCHEDULER
+# ============================================================
+
+class GpuScheduler:
+    """Manages GPU time slots for multiple agents on shared hardware.
+
+    The keeper sees who needs the GPU, how long they need it,
+    and finds the best time. Like a lighthouse scheduling
+    ship passages through a narrow channel.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.current_holder = config.get('gpu', {}).get('current_holder', '')
+        self.holder_expires = config.get('gpu', {}).get('holder_expires', '')
+        self.schedule: List[Dict] = []
+        self.schedule_path = config.get('coordination', {}).get('schedule_path', '')
+        self._load_schedule()
+
+    def request_gpu(self, agent_name: str, duration_min: int, priority: int = 5,
+                    reason: str = "") -> Tuple[bool, str]:
+        """Agent requests GPU time. Returns (approved, wait_time_or_reason)."""
+        now = datetime.utcnow()
+
+        # Check if currently held by another agent
+        if self.current_holder and self.current_holder != agent_name:
+            if self.holder_expires:
+                expires = self._parse_time(self.holder_expires)
+                if expires > now:
+                    wait_min = int((expires - now).total_seconds() / 60)
+                    # Higher priority can preempt
+                    if priority > 5:
+                        self._evict_current(f"{agent_name} has higher priority")
+                    else:
+                        return False, f"GPU held by {self.current_holder} for {wait_min} more minutes"
+
+        # Approve
+        expires = now + timedelta(minutes=duration_min)
+        self.current_holder = agent_name
+        self.holder_expires = expires.isoformat()
+
+        entry = ScheduleEntry(
+            timestamp=now.isoformat(), agent_name=agent_name,
+            resource="gpu", amount="exclusive", duration_min=duration_min,
+            priority=priority, reason=reason, status="active",
+        )
+        self.schedule.append(asdict(entry))
+        self._save_schedule()
+        return True, f"Granted {duration_min} min, expires {expires.isoformat()}"
+
+    def release_gpu(self, agent_name: str):
+        if self.current_holder == agent_name:
+            self.current_holder = ""
+            self.holder_expires = ""
+            for entry in reversed(self.schedule):
+                if entry.get('agent_name') == agent_name and entry.get('status') == 'active':
+                    entry['status'] = 'completed'
+                    break
+            self._save_schedule()
+
+    def get_status(self) -> Dict:
+        now = datetime.utcnow()
+        status = {
+            'current_holder': self.current_holder,
+            'holder_expires': self.holder_expires,
+            'is_available': True,
+        }
+        if self.current_holder and self.holder_expires:
+            if self._parse_time(self.holder_expires) > now:
+                status['is_available'] = False
+        return status
+
+    def find_best_window(self, duration_min: int) -> Optional[str]:
+        """Find the best upcoming time window for a GPU-heavy task."""
+        now = datetime.utcnow()
+        if self.current_holder and self.holder_expires:
+            expires = self._parse_time(self.holder_expires)
+            if expires > now:
+                return expires.isoformat()
+        return now.isoformat()
+
+    def _evict_current(self, reason: str):
+        old = self.current_holder
+        self.current_holder = ""
+        self.holder_expires = ""
+        for entry in self.schedule:
+            if entry.get('agent_name') == old and entry.get('status') == 'active':
+                entry['status'] = 'evicted'
+                entry['reason'] = reason
+        self._save_schedule()
+
+    def _load_schedule(self):
+        if self.schedule_path and os.path.exists(self.schedule_path):
+            try:
+                self.schedule = json.load(open(self.schedule_path))
+            except: self.schedule = []
+
+    def _save_schedule(self):
+        if self.schedule_path:
+            try:
+                json.dump(self.schedule, open(self.schedule_path, 'w'), indent=2)
+            except: pass
+
+    def _parse_time(self, t: str) -> datetime:
+        try: return datetime.fromisoformat(t)
+        except: return datetime.utcnow()
+
+
+# ============================================================
+# v2: MULTI-AGENT COORDINATOR
+# ============================================================
+
+class MultiAgentCoordinator:
+    """Coordinates multiple agents sharing the same hardware.
+
+    When you have several OpenClaws on one workstation with an RTX 5090,
+    the keeper is who they negotiate with for shared resources.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.registered: Dict[str, Dict] = config.get('coordination', {}).get('agents', {})
+
+    def register_agent(self, name: str, pid: int, rss_limit_mb: int = 1024,
+                       gpu_quota_pct: int = 50, priority: int = 5):
+        self.registered[name] = {
+            'pid': pid, 'rss_limit_mb': rss_limit_mb,
+            'gpu_quota_pct': gpu_quota_pct, 'priority': priority,
+            'registered_at': datetime.utcnow().isoformat(),
+        }
+
+    def get_agent_status(self, snapshot: ResourceSnapshot) -> Dict[str, Dict]:
+        status = {}
+        for name, info in self.registered.items():
+            rss = self._get_process_rss(info['pid'])
+            status[name] = {
+                'pid': info['pid'],
+                'rss_mb': rss,
+                'rss_limit_mb': info['rss_limit_mb'],
+                'rss_pct': (rss / info['rss_limit_mb'] * 100) if info['rss_limit_mb'] > 0 else 0,
+                'priority': info['priority'],
+                'gpu_quota_pct': info['gpu_quota_pct'],
+                'over_limit': rss > info['rss_limit_mb'],
+            }
+        return status
+
+    def total_rss(self) -> int:
+        total = 0
+        for info in self.registered.values():
+            total += self._get_process_rss(info.get('pid', 0))
+        return total
+
+    def _get_process_rss(self, pid: int) -> int:
+        if not pid: return 0
+        try:
+            with open(f'/proc/{pid}/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return int(line.split()[1]) // 1024
+        except: return 0
+
+
+# ============================================================
+# OPERATIONAL LOGGER (v1 + v2 logs)
 # ============================================================
 
 class OperationalLogger:
-    """Logs external changes, not internal diaries.
-
-    The keeper records:
-    - Changes to data the agent taps (API responses, file changes)
-    - Network traffic patterns and latency
-    - Commit activity and repo state changes
-    - Resource consumption trends
-    - Process lifecycle events
-
-    The keeper does NOT record:
-    - The agent's internal reasoning
-    - Conversation content
-    - Skill execution details
-    """
-
     def __init__(self, config):
         self.config = config
         log_dir = Path(config['logs']['dir'])
         log_dir.mkdir(parents=True, exist_ok=True)
 
-    def log_operation(self, change: OperationalChange):
-        self._append('operational', json.dumps(asdict(change)))
-
-    def log_resources(self, snapshot: ResourceSnapshot):
-        self._append('resource', json.dumps(asdict(snapshot)))
-
-    def log_alert(self, alert: Alert):
-        self._append('alert', json.dumps(asdict(alert)))
-
-    def log_process(self, event: ProcessEvent):
-        self._append('process', json.dumps(asdict(event)))
-
-    def _append(self, log_type: str, line: str):
+    def log(self, log_type: str, data):
         filename = self.config['logs'].get(log_type, f'{log_type}.log')
         path = Path(self.config['logs']['dir']) / filename
         try:
+            line = json.dumps(data) if not isinstance(data, str) else data
             with open(path, 'a') as f:
                 f.write(line + '\n')
-        except Exception as e:
-            print(f"[keeper] log write error: {e}", file=sys.stderr)
-
-    def snapshot_state(self) -> Dict:
-        """Capture current external state for comparison."""
-        state = {}
-        # Git status of key repos
-        workspace = Path(os.environ.get('OPENCLAW_WORKSPACE', '/home/lucineer/.openclaw/workspace'))
-        if workspace.exists():
-            try:
-                r = subprocess.run(['git', 'status', '--porcelain'],
-                                 capture_output=True, text=True, cwd=workspace, timeout=10)
-                state['workspace_dirty_files'] = len(r.stdout.strip().split('\n')) if r.stdout.strip() else 0
-            except: pass
-
-            try:
-                r = subprocess.run(['git', 'log', '-1', '--format=%H %s'],
-                                 capture_output=True, text=True, cwd=workspace, timeout=10)
-                state['workspace_last_commit'] = r.stdout.strip()
-            except: pass
-
-        # Network connectivity check
-        state['network_up'] = os.system('ping -c1 -W2 8.8.8.8 >/dev/null 2>&1') == 0
-
-        # OpenClaw gateway status
-        try:
-            r = subprocess.run(['openclaw', 'gateway', 'status'],
-                             capture_output=True, text=True, timeout=10)
-            state['gateway_status'] = r.stdout.strip()[:200]
-        except:
-            state['gateway_status'] = 'unreachable'
-
-        return state
+        except: pass
 
 
 # ============================================================
-# SELF-HEALER
+# SELF-HEALER (v1, unchanged)
 # ============================================================
 
 class SelfHealer:
-    """Automatic recovery actions when the agent is in trouble."""
-
-    def __init__(self, config, logger: OperationalLogger):
+    def __init__(self, config, logger):
         self.config = config
         self.logger = logger
 
-    def heal(self, snapshot: ResourceSnapshot, events: List[ProcessEvent]) -> List[str]:
+    def heal(self, snapshot, events):
         actions = []
-        healing = self.config['healing']
-
-        # Check if gateway is down
-        gateway_stopped = any(
-            e.event_type == "stopped" and "gateway" in e.process_name
-            for e in events
-        )
-
-        if gateway_stopped and healing['auto_restart_gateway']:
-            actions.append("Restarting openclaw gateway...")
+        for e in events:
+            if e.get('event_type') == 'stopped' and 'gateway' in e.get('process_name', ''):
+                if self.config.get('healing', {}).get('auto_restart_gateway'):
+                    try:
+                        subprocess.run(['openclaw', 'gateway', 'restart'], capture_output=True, timeout=30)
+                        actions.append("Restarted gateway")
+                    except Exception as ex:
+                        actions.append(f"Gateway restart failed: {ex}")
+        if self.config.get('healing', {}).get('auto_clean_tmp') and snapshot.disk_percent > self.config['thresholds']['disk_warning']:
             try:
-                subprocess.run(['openclaw', 'gateway', 'restart'],
-                             capture_output=True, timeout=30)
-                self.logger.log_operation(OperationalChange(
-                    timestamp=datetime.utcnow().isoformat(),
-                    category="process", description="Gateway auto-restarted by keeper",
-                    severity="warning"
-                ))
-            except Exception as e:
-                actions.append(f"Gateway restart failed: {e}")
-
-        # Clean /tmp if disk is getting full
-        if healing['auto_clean_tmp'] and snapshot.disk_percent > self.config['thresholds']['disk_warning']:
-            actions.append("Cleaning /tmp...")
-            try:
-                cleaned = subprocess.run(
-                    ['find', '/tmp', '-type', 'f', '-mtime', '+1', '-delete'],
-                    capture_output=True, timeout=30
-                )
-                actions.append(f"Cleaned old /tmp files")
-            except Exception as e:
-                actions.append(f"Tmp clean failed: {e}")
-
+                subprocess.run(['find', '/tmp', '-type', 'f', '-mtime', '+1', '-delete'], capture_output=True, timeout=30)
+                actions.append("Cleaned /tmp")
+            except: pass
         return actions
-
-    def kill_risky_process(self, pid: int, reason: str) -> bool:
-        try:
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(2)
-            os.kill(pid, signal.SIGKILL)
-            self.logger.log_operation(OperationalChange(
-                timestamp=datetime.utcnow().isoformat(),
-                category="process", description=f"Killed PID {pid}: {reason}",
-                severity="critical"
-            ))
-            return True
-        except:
-            return False
 
 
 # ============================================================
-# THE KEEPER — Main Loop
+# THE KEEPER v2 — Main Loop
 # ============================================================
 
 class BrothersKeeper:
-    """The Lighthouse Keeper.
-
-    Sits on the shore. Watches the waters. Lights the beacon when needed.
-    """
-
     def __init__(self, config: Dict = None):
         self.config = config or DEFAULT_CONFIG
         self.monitor = ResourceMonitor()
         self.watchdog = ProcessWatchdog(self.config)
-        self.risk = RiskAssessor(self.config)
         self.logger = OperationalLogger(self.config)
         self.healer = SelfHealer(self.config, self.logger)
+
+        # v2 components
+        self.flywheel = FlywheelMonitor(self.config) if self.config.get('flywheel', {}).get('enabled') else None
+        self.token_steward = TokenSteward(self.config) if self.config.get('token_steward', {}).get('enabled') else None
+        self.gpu_scheduler = GpuScheduler(self.config) if self.config.get('gpu', {}).get('enabled') else None
+        self.coordinator = MultiAgentCoordinator(self.config) if self.config.get('coordination', {}).get('enabled') else None
+
         self.running = True
         self.last_alert_time: Dict[str, datetime] = {}
-        self.cpu_history: List[float] = []
 
-    def start(self, check_interval: int = 30):
-        """Main watch loop."""
-        print(f"[keeper] Brothers Keeper starting. Check interval: {check_interval}s", flush=True)
-        self.logger.log_operation(OperationalChange(
-            timestamp=datetime.utcnow().isoformat(),
-            category="config", description="Brothers Keeper started",
-            severity="info"
-        ))
-
+    def start(self, check_interval: int = 60):
+        print(f"[keeper] Brothers Keeper v2 starting. Interval: {check_interval}s", flush=True)
+        self.logger.log('operational', {'timestamp': datetime.utcnow().isoformat(), 'category': 'config', 'description': 'Keeper v2 started', 'severity': 'info'})
         while self.running:
             try:
                 self._tick()
@@ -605,143 +845,122 @@ class BrothersKeeper:
             time.sleep(check_interval)
 
     def _tick(self):
-        # 1. Take resource snapshot
-        snapshot = self.monitor.snapshot()
-        self.logger.log_resources(snapshot)
-        self.cpu_history.append(snapshot.cpu_percent)
-        if len(self.cpu_history) > 100:
-            self.cpu_history = self.cpu_history[-100:]
+        now = datetime.utcnow()
+        snapshot = self.monitor.snapshot(self.config)
+        self.logger.log('resource', asdict(snapshot))
 
-        # 2. Check processes
+        # v1: process watchdog
         events = self.watchdog.check()
-        for event in events:
-            self.logger.log_process(event)
-            if event.event_type in ("stopped", "stuck"):
-                self._alert("process", f"{event.process_name}: {event.event_type}",
-                           f"PID {event.pid}: {event.details}")
+        for e in events:
+            self.logger.log('process', e)
+            if e.get('event_type') in ('stopped', 'stuck'):
+                self._alert('process', f"{e['process_name']}: {e['event_type']}", e.get('pid', ''))
 
-        # 3. Check resource thresholds
-        thresholds = self.config['thresholds']
-        if snapshot.ram_percent > thresholds['ram_critical']:
-            self._alert("resource", "RAM critical",
-                       f"{snapshot.ram_percent:.1f}% ({snapshot.ram_used_mb}/{snapshot.ram_total_mb}MB)")
-            # Kill highest memory process if not the agent itself
-            self._emergency_ram_cleanup(snapshot)
-        elif snapshot.ram_percent > thresholds['ram_warning']:
-            self._alert("resource", "RAM warning",
-                       f"{snapshot.ram_percent:.1f}% ({snapshot.ram_used_mb}/{snapshot.ram_total_mb}MB)")
+        # v1: resource thresholds
+        t = self.config['thresholds']
+        if snapshot.ram_percent > t['ram_critical']:
+            self._alert('resource', 'RAM critical', f"{snapshot.ram_percent:.1f}%")
+        elif snapshot.ram_percent > t['ram_warning']:
+            self._alert('resource', 'RAM warning', f"{snapshot.ram_percent:.1f}%")
+        if snapshot.swap_percent > t['swap_warning']:
+            self._alert('resource', 'Swap pressure', f"{snapshot.swap_percent:.1f}%")
+        if snapshot.disk_percent > t['disk_warning']:
+            self._alert('resource', 'Disk filling', f"{snapshot.disk_percent:.1f}%")
 
-        if snapshot.swap_percent > thresholds['swap_warning']:
-            self._alert("resource", "Swap pressure",
-                       f"{snapshot.swap_percent:.1f}% ({snapshot.swap_used_mb}MB)")
+        # v2: flywheel monitor
+        if self.flywheel:
+            fw = self.flywheel.check()
+            self.logger.log('flywheel', asdict(fw))
+            if fw.status == "stuck" and self.flywheel.should_nudge(fw.agent_name):
+                self._alert('flywheel', f'{fw.agent_name} STUCK', fw.reason)
+                self.flywheel.nudge(fw.agent_name)
+            elif fw.status == "idle" and self.flywheel.should_nudge(fw.agent_name):
+                self._alert('flywheel', f'{fw.agent_name} idle', fw.reason)
 
-        if snapshot.disk_percent > thresholds['disk_warning']:
-            self._alert("resource", "Disk filling up",
-                       f"{snapshot.disk_percent:.1f}% ({snapshot.disk_used_gb:.1f}GB)")
+        # v2: GPU monitoring
+        if self.gpu_scheduler and snapshot.gpu_mem_total_mb > 0:
+            gpu_pct = (snapshot.gpu_mem_used_mb / snapshot.gpu_mem_total_mb * 100) if snapshot.gpu_mem_total_mb > 0 else 0
+            if gpu_pct > self.config.get('gpu', {}).get('max_gpu_mem_pct', 90):
+                self._alert('resource', 'GPU memory critical', f"{gpu_pct:.0f}%")
 
-        # Sustained high CPU
-        if len(self.cpu_history) >= 10:
-            recent = self.cpu_history[-10:]
-            if all(c > thresholds['cpu_warning'] for c in recent):
-                self._alert("resource", "Sustained high CPU",
-                           f"10/10 samples above {thresholds['cpu_warning']}%")
-
-        # 4. Self-heal if needed
+        # v1: self-heal
         actions = self.healer.heal(snapshot, events)
-        for action in actions:
-            print(f"[keeper] heal: {action}", flush=True)
+        for a in actions:
+            print(f"[keeper] heal: {a}", flush=True)
 
-        # 5. Periodically snapshot external state
-        state = self.logger.snapshot_state()
-        if not state.get('network_up'):
-            self._alert("resource", "Network down", "8.8.8.8 unreachable")
-
-    def _alert(self, category: str, title: str, detail: str):
-        """Send alert with cooldown."""
+    def _alert(self, category, title, detail):
         key = f"{category}:{title}"
         now = datetime.utcnow()
-        cooldown = timedelta(seconds=self.config['beacon']['coalesce_sec'])
-
-        if key in self.last_alert_time and (now - self.last_alert_time[key]) < cooldown:
+        cd = timedelta(seconds=self.config.get('beacon', {}).get('coalesce_sec', 300))
+        if key in self.last_alert_time and (now - self.last_alert_time[key]) < cd:
             return
         self.last_alert_time[key] = now
+        self.logger.log('alert', {'timestamp': now.isoformat(), 'level': 'warning', 'category': category, 'message': f"{title}: {detail}"})
+        print(f"[keeper] ALERT [{category}] {title} — {detail}", flush=True)
 
-        alert = Alert(
-            timestamp=now.isoformat(),
-            level="warning" if "critical" not in title.lower() else "critical",
-            category=category,
-            message=f"{title}: {detail}"
-        )
-        self.logger.log_alert(alert)
+    # --- v2 Public API (called by agents via IPC/file/socket) ---
 
-        method = self.config['beacon']['method']
-        if method == "telegram" and self.config['beacon']['telegram_chat_id']:
-            self._send_telegram(alert)
-        elif method == "webhook" and self.config['beacon']['webhook_url']:
-            self._send_webhook(alert)
-        else:
-            print(f"[keeper] ALERT [{alert.level}] {category}: {title} — {detail}", flush=True)
+    def pre_flight(self) -> Tuple[bool, List[str]]:
+        snapshot = self.monitor.snapshot(self.config)
+        warnings = []
+        approved = True
+        t = self.config['thresholds']
+        if snapshot.ram_percent > t['ram_critical']:
+            warnings.append(f"RAM critical: {snapshot.ram_percent:.1f}%")
+            approved = False
+        elif snapshot.ram_percent > t['ram_warning']:
+            warnings.append(f"RAM warning: {snapshot.ram_percent:.1f}%")
+        if snapshot.gpu_mem_total_mb > 0:
+            gpu_pct = snapshot.gpu_mem_used_mb / snapshot.gpu_mem_total_mb * 100
+            if gpu_pct > self.config.get('gpu', {}).get('max_gpu_mem_pct', 90):
+                warnings.append(f"GPU memory high: {gpu_pct:.0f}%")
+                approved = False
+        return approved, warnings
 
-    def _emergency_ram_cleanup(self, snapshot: ResourceSnapshot):
-        """Kill non-essential high-memory processes."""
-        killed = []
-        for proc in snapshot.top_processes:
-            if proc['rss_mb'] > self.config['risk']['max_single_process_mb']:
-                cmd = proc['command'].lower()
-                # Don't kill the agent itself
-                if any(skip in cmd for skip in ['openclaw', 'keeper', 'systemd', 'init']):
-                    continue
-                if self.healer.kill_risky_process(proc['pid'], f"RSS {proc['rss_mb']}MB exceeds limit"):
-                    killed.append(f"{proc['command'][:40]} (PID {proc['pid']}, {proc['rss_mb']}MB)")
-        if killed:
-            self.logger.log_operation(OperationalChange(
-                timestamp=datetime.utcnow().isoformat(),
-                category="process",
-                description=f"Emergency RAM cleanup: killed {len(killed)} processes",
-                before=", ".join(killed),
-                severity="critical"
-            ))
+    def request_gpu(self, agent: str, duration_min: int, priority: int = 5, reason: str = "") -> Tuple[bool, str]:
+        if not self.gpu_scheduler:
+            return True, "GPU scheduling not enabled"
+        return self.gpu_scheduler.request_gpu(agent, duration_min, priority, reason)
 
-    def _send_telegram(self, alert: Alert):
-        try:
-            import requests
-            url = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN')}/sendMessage"
-            requests.post(url, json={
-                'chat_id': self.config['beacon']['telegram_chat_id'],
-                'text': f"🪨 [{alert.level.upper()}] {alert.category}\n{alert.message}",
-                'parse_mode': 'HTML'
-            }, timeout=10)
-        except: pass
+    def release_gpu(self, agent: str):
+        if self.gpu_scheduler:
+            self.gpu_scheduler.release_gpu(agent)
 
-    def _send_webhook(self, alert: Alert):
-        try:
-            import requests
-            requests.post(self.config['beacon']['webhook_url'],
-                        json=asdict(alert), timeout=10)
-        except: pass
+    def request_tokens(self, agent: str, provider: str, cost: float = 0) -> Tuple[bool, str]:
+        if not self.token_steward:
+            return True, "Token stewardship not enabled"
+        return self.token_steward.request_tokens(agent, provider, cost)
 
-    def pre_flight_check(self) -> tuple:
-        """Public API for agents to check before heavy operations."""
-        snapshot = self.monitor.snapshot()
-        return self.risk.pre_flight(snapshot)
+    def report_token_usage(self, agent: str, tokens: int, cost: float = 0):
+        if self.token_steward:
+            self.token_steward.report_usage(agent, tokens, cost)
+
+    def get_status(self) -> Dict:
+        snapshot = self.monitor.snapshot(self.config)
+        status = {
+            'timestamp': snapshot.timestamp,
+            'resources': asdict(snapshot),
+            'flywheel': asdict(self.flywheel.state.get('main', FlywheelState(timestamp='', agent_name='', status='unknown'))) if self.flywheel else None,
+            'gpu': self.gpu_scheduler.get_status() if self.gpu_scheduler else None,
+            'agents': self.coordinator.get_agent_status(snapshot) if self.coordinator else None,
+            'token_usage': self.token_steward.get_usage_report() if self.token_steward else None,
+        }
+        return status
 
     def stop(self):
         self.running = False
-        self.logger.log_operation(OperationalChange(
-            timestamp=datetime.utcnow().isoformat(),
-            category="config", description="Brothers Keeper stopped",
-            severity="info"
-        ))
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Brothers Keeper — The Lighthouse Keeper")
-    parser.add_argument('--config', '-c', help='Path to config JSON')
-    parser.add_argument('--interval', '-i', type=int, default=30, help='Check interval in seconds')
-    parser.add_argument('--once', action='store_true', help='Run one check and exit')
-    parser.add_argument('--status', action='store_true', help='Print current status and exit')
-    parser.add_argument('--preflight', action='store_true', help='Pre-flight resource check')
+    parser = argparse.ArgumentParser(description="Brothers Keeper v2 — The Lighthouse Keeper")
+    parser.add_argument('--config', '-c', help='Config JSON')
+    parser.add_argument('--interval', '-i', type=int, default=60)
+    parser.add_argument('--once', action='store_true')
+    parser.add_argument('--status', action='store_true')
+    parser.add_argument('--preflight', action='store_true')
+    parser.add_argument('--gpu-status', action='store_true')
+    parser.add_argument('--token-report', action='store_true')
     args = parser.parse_args()
 
     config = DEFAULT_CONFIG.copy()
@@ -752,18 +971,18 @@ def main():
     keeper = BrothersKeeper(config)
 
     if args.status:
-        snapshot = keeper.monitor.snapshot()
-        print(json.dumps(asdict(snapshot), indent=2))
+        print(json.dumps(keeper.get_status(), indent=2, default=str))
         return
-
     if args.preflight:
-        approved, warnings = keeper.pre_flight_check()
-        if approved:
-            print("CLEAR — resources available")
-        else:
-            print(f"HOLD — {'; '.join(warnings)}")
+        ok, warns = keeper.pre_flight()
+        print("CLEAR" if ok else f"HOLD — {'; '.join(warns)}")
         return
-
+    if args.gpu_status:
+        print(json.dumps(keeper.gpu_scheduler.get_status() if keeper.gpu_scheduler else {"enabled": False}, indent=2))
+        return
+    if args.token_report:
+        print(json.dumps(keeper.token_steward.get_usage_report() if keeper.token_steward else {}, indent=2))
+        return
     if args.once:
         keeper._tick()
         return
