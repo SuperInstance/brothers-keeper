@@ -1,0 +1,18 @@
+[Unit]
+Description=Brothers Keeper -- Lighthouse Watchdog for Agent Runtimes
+After=network.target
+Documentation=https://github.com/Lucineer/brothers-keeper
+
+[Service]
+Type=simple
+User=lucineer
+ExecStart=/usr/bin/python3 /opt/brothers-keeper/keeper.py --interval 30
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+AmbientCapabilities=CAP_KILL CAP_SYS_PTRACE
+MemoryMax=64M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target
