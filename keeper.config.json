@@ -3,10 +3,6 @@
     {
       "name": "openclaw-gateway",
       "cmd": "pgrep -f 'openclaw.*gateway'"
-    },
-    {
-      "name": "node-agent",
-      "cmd": "pgrep -f 'openclaw.*agent'"
     }
   ],
   "thresholds": {
@@ -18,18 +14,13 @@
     "swap_warning": 50
   },
   "process": {
-    "check_interval_sec": 30,
+    "check_interval_sec": 60,
     "restart_cooldown_sec": 300,
-    "max_restart_attempts": 3,
-    "kill_after_stuck_sec": 300
+    "max_restart_attempts": 3
   },
   "risk": {
     "max_concurrent_execs": 5,
-    "max_single_process_mb": 512,
-    "dangerous_patterns": [
-      "fork bomb",
-      "while true"
-    ],
+    "max_single_process_mb": 2048,
     "pre_flight_check": true
   },
   "logs": {
@@ -38,20 +29,52 @@
     "resource": "resources.log",
     "alert": "alerts.log",
     "process": "processes.log",
-    "max_log_mb": 100,
-    "retention_days": 30
+    "flywheel": "flywheel.log",
+    "token": "token_usage.log",
+    "schedule": "schedule.log"
   },
   "healing": {
     "auto_restart_gateway": true,
     "auto_doctor_fix": true,
     "auto_clean_tmp": true,
-    "tmp_max_gb": 5,
-    "notify_on_heal": true
+    "tmp_max_gb": 5
   },
   "beacon": {
     "method": "log",
-    "webhook_url": "",
     "telegram_chat_id": "",
+    "webhook_url": "",
     "coalesce_sec": 300
+  },
+  "flywheel": {
+    "enabled": true,
+    "idle_timeout_min": 15,
+    "stuck_timeout_min": 30,
+    "checkpoint_file": "",
+    "nudge_cooldown_min": 10,
+    "git_repos": [
+      "/home/lucineer/.openclaw/workspace"
+    ],
+    "commit_check_interval_sec": 300
+  },
+  "gpu": {
+    "enabled": true,
+    "current_holder": "",
+    "holder_expires": "",
+    "monitor_cmd": "nvidia-smi",
+    "max_gpu_mem_pct": 90
+  },
+  "token_steward": {
+    "enabled": true,
+    "vault_path": "",
+    "allowances": {},
+    "zero_trust": false,
+    "checkpoint_gated": false
+  },
+  "coordination": {
+    "enabled": true,
+    "agents": {},
+    "max_agents": 4,
+    "resource_sharing": true,
+    "schedule_path": ""
   }
 }
